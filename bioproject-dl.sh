@@ -1,9 +1,9 @@
 #!/bin/bash
 # Title: bioproject-dl.sh
-# Version: 0.0
+# Version: 0.1
 # Author: Frédéric CHEVALIER <fcheval@txbiomed.org>
 # Created in: 2022-04-09
-# Modified in:
+# Modified in: 2022-04-11
 # Licence : GPL v3
 
 
@@ -20,6 +20,7 @@ aim="Download fastq files from a given BioProject."
 # Versions #
 #==========#
 
+# v0.1 - 2022-04-11: add parallel downloads
 # v0.0 - 2022-04-09: creation
 
 version=$(grep -i -m 1 "version" "$0" | cut -d ":" -f 2 | sed "s/^ *//g")
@@ -33,7 +34,7 @@ version=$(grep -i -m 1 "version" "$0" | cut -d ":" -f 2 | sed "s/^ *//g")
 # Usage message
 function usage {
     echo -e "
-    \e[32m ${0##*/} \e[00m -b|--bp value -d|--dir path -s|--skip -h|--help
+    \e[32m ${0##*/} \e[00m -b|--bp value -d|--dir path -p|--pl number -s|--skip -h|--help
 
 Aim: $aim
 
@@ -42,6 +43,7 @@ Version: $version
 Options:
     -b, --bp        BioProject number
     -d, --dir       target directory
+    -p, --pl        number of parallel SRA downloads [default: 10]
     -s, --skip      skip download if fastq file already present
     -h, --help      this message
     "
@@ -120,7 +122,50 @@ function ProgressBar {
 ## Usage: clean_up file1 file2 ...
 function clean_up {
     rm -rf $@
+    exit 0
+}
+
+function clean_up_kill {
+    echo
+    [[ -n "$run" ]] && rm -rf runinfo "$ldir/$fln/$run"*
+    [[ -n $myjobs ]] && kill ${myjobs[@]} 2> /dev/null
     exit 1
+}
+
+
+# Prefetch
+function myprefetch {
+    #Download
+    retry=0
+    while [[ $retry -lt 2 ]]
+    do
+        # Download SRA file
+        prefetch -X 1T -C yes -r yes -O "$1/$2/" $3 &>> "$4"
+        [[ $(find "$1/$2/$3" 2> /dev/null) ]] && break || ((retry++))  #|| break
+    done
+
+    # If max download trials reached, issue message and move to the next
+    if [[ $retry -eq 2 ]]
+    then
+        echo "$run: dowloading error" >> "$4"
+        return 1
+    fi
+
+    # Convert sra into fastq
+    fasterq-dump -O "$1/$2/" -f --split-files "$1/$2/$3" &>> "$4"
+    rm -R "$1/$2/$3"
+
+    # Rename file with more meaningful name
+    if [[ $(find "$1/$2/" -name "*.fastq" | wc -l) -eq 2 ]]
+    then
+        mv "$1/$2/${3}_1.fastq" "$1/$2/${2}_R1.fastq"
+        mv "$1/$2/${3}_2.fastq" "$1/$2/${2}_R2.fastq"
+    else
+        mv "$1/$2/${3}.fastq" "$1/$2/${2}_R1.fastq"
+    fi
+
+    # Compress
+    find "$1/$2/" -name "*.fastq" -exec pigz {} +
 }
 
 
@@ -131,7 +176,7 @@ function clean_up {
 
 test_dep wget 
 test_dep prefetch
-test_dep fastq-dump
+test_dep fasterq-dump
 
 
 
@@ -145,6 +190,7 @@ do
     case $1 in
         -b|--bp     ) bioproject="$2" ; shift 2 ;;
         -d|--dir    ) ldir="$2"       ; shift 2 ;;
+        -p|--pl     ) pl="$2"         ; shift 2 ;;
         -s|--skip   ) skip="skip"     ; shift   ;;
         -h|--help   ) usage ; exit 0 ;;
         *           ) error "Invalid option: $1\n$(usage)" 1 ;;
@@ -154,7 +200,10 @@ done
 
 # Check the existence of obligatory options
 [[ -z "$bioproject" ]] && error "BioProject is required. Exiting...\n$(usage)" 1
+
+# Default values
 [[ -z "$ldir" ]] && ldir="."
+[[ -z $pl ]] && pl=10
 
 log="$ldir/log"
 
@@ -166,25 +215,24 @@ log="$ldir/log"
 
 # Handling status and exit
 set -o pipefail
-trap 'echo ; clean_up runinfo $ldir/$fln/$run*' SIGINT SIGTERM
+trap 'clean_up_kill' SIGINT SIGTERM
 trap 'clean_up runinfo $log' EXIT
 
 # Download related information to data project
-wget -q -O runinfo "https://trace.ncbi.nlm.nih.gov/Traces/sra/sra.cgi?save=efetch&rettype=runinfo&db=sra&term=${bioproject}"
-[[ $(sed "/^$/d" runinfo | wc -l) -eq 0 ]] && error "Bioproject does not seem to exists. Exiting..." 0
+runinfo=$(wget -q -O - "https://trace.ncbi.nlm.nih.gov/Traces/sra/sra.cgi?save=efetch&rettype=runinfo&db=sra&term=${bioproject}")
+[[ $(sed "/^$/d" <<< "$runinfo" | wc -l) -eq 0 ]] && error "Bioproject does not seem to exists. Exiting..." 0
 
 # Field of interest (library name and weblink)
-fdn=$(head -n 1 runinfo | tr "," "\n" | grep -w -n "SampleName" | cut -d ":" -f 1)
-fdr=$(head -n 1 runinfo | tr "," "\n" | grep -w -n "Run" | cut -d ":" -f 1)
-flk=$(head -n 1 runinfo | tr "," "\n" | grep -w -n "download_path" | cut -d ":" -f 1)
+fdn=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "SampleName" | cut -d ":" -f 1)
+fdr=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "Run" | cut -d ":" -f 1)
+flk=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "download_path" | cut -d ":" -f 1)
 
 # Download fastq files
-myend=$(wc -l <(tail -n +2 runinfo | sed "/^$/d"))
+myend=$(tail -n +2 <<< "$runinfo" | sed "/^$/d" | wc -l)
 while read line
 do
-    # Progress bar
+    # Counter
     ((mystep++))
-    ProgressBar $mystep $myend
 
     # Filename, run and download link
     fln=$(cut -d "," -f $fdn <<<$line)
@@ -198,34 +246,32 @@ do
     if [[ "$skip" ]]
     then
         ls_fl=$(find "$ldir/$fln/" -name "${fln}_R*.fastq*" | wc -l)
-        [[ $ls_fl -eq 2 ]] && continue
+        [[ $ls_fl -gt 0 ]] && continue
     fi
     
-    # Download
-    retry=0
-    while [[ $retry -lt 2 ]]
+    # Pause when number of running job is expected
+    myjobs=($(jobs -p))
+    while [[ ${#myjobs[@]} -ge $pl ]]
     do
-        # Download sra file
-        prefetch -C yes -r yes -O "$ldir/$fln/" $run &>> "$log"
-        [[ ! $(find "$ldir/$fln/$run" 2> /dev/null) ]] && ((retry++)) || break
+        sleep 30s
+        myjobs=($(jobs -p))
     done
-    
-    # If max download trials reached, issue message and move to the next
-    [[ $retry -eq 2 ]] && echo "$run: dowloading problem" >> "$log" && continue
-    
-    # Convert sra into fastq
-    fastq-dump -O "$ldir/$fln/" --split-files "$ldir/$fln/$run" &> "$log"
-    rm -R "$ldir/$fln/$run"
-    
-    # Rename file with more meaningful name
-    mv "$ldir/$fln/${run}_1.fastq" "$ldir/$fln/${fln}_R1.fastq"
-    mv "$ldir/$fln/${run}_2.fastq" "$ldir/$fln/${fln}_R2.fastq"
-        
-done < <(tail -n +2 runinfo | sed "/^$/d")
 
-# Compress files
-info "Compressing fastq files..."
-find "$ldir/" -name "*fastq" -exec pigz {} +
+    # Fetch SRA file in the background (except if last)
+    if [[ $mystep -lt $myend ]]
+    then
+        (myprefetch "$ldir" "$fln" "$run" "$log") &
+    else
+        myprefetch "$ldir" "$fln" "$run" "$log"
+    fi
+
+    # Progress bar
+    ProgressBar $mystep $myend
+
+done < <(tail -n +2 <<< "$runinfo" | sed "/^$/d")
+
+# Wait until every background job is done
+wait $(jobs -p)
 
 # Check for errors
 [[ $(grep -E -i "error|warning" "$log") ]] && warning "Errors or waning present in $log." && exit 1
