@@ -1,10 +1,10 @@
 #!/bin/bash
 # Title: bioproject-dl.sh
-# Version: 0.1
+# Version: 0.2
 # Author: Frédéric CHEVALIER <fcheval@txbiomed.org>
 # Created in: 2022-04-09
-# Modified in: 2022-04-11
-# Licence : GPL v3
+# Modified in: 2022-04-13
+# License: GPL v3
 
 
 
@@ -20,7 +20,8 @@ aim="Download fastq files from a given BioProject."
 # Versions #
 #==========#
 
-# v0.1 - 2022-04-11: add parallel downloads
+# v0.2 - 2022-04-13: add option to load runinfo file
+# v0.1 - 2022-04-11: add parallel downloads / improve trap / improve runinfo handling
 # v0.0 - 2022-04-09: creation
 
 version=$(grep -i -m 1 "version" "$0" | cut -d ":" -f 2 | sed "s/^ *//g")
@@ -34,7 +35,7 @@ version=$(grep -i -m 1 "version" "$0" | cut -d ":" -f 2 | sed "s/^ *//g")
 # Usage message
 function usage {
     echo -e "
-    \e[32m ${0##*/} \e[00m -b|--bp value -d|--dir path -p|--pl number -s|--skip -h|--help
+    \e[32m ${0##*/} \e[00m -b|--bp value -d|--dir path --r|--ri path -p|--pl number -s|--skip -h|--help
 
 Aim: $aim
 
@@ -43,6 +44,7 @@ Version: $version
 Options:
     -b, --bp        BioProject number
     -d, --dir       target directory
+    -r, --ri        provide a runinfo file instead of the automatic download
     -p, --pl        number of parallel SRA downloads [default: 10]
     -s, --skip      skip download if fastq file already present
     -h, --help      this message
@@ -127,7 +129,7 @@ function clean_up {
 
 function clean_up_kill {
     echo
-    [[ -n "$run" ]] && rm -rf runinfo "$ldir/$fln/$run"*
+    [[ -n "$run" ]] && rm -rf "$ldir/$fln/$run"*
     [[ -n $myjobs ]] && kill ${myjobs[@]} 2> /dev/null
     exit 1
 }
@@ -160,7 +162,8 @@ function myprefetch {
     then
         mv "$1/$2/${3}_1.fastq" "$1/$2/${2}_R1.fastq"
         mv "$1/$2/${3}_2.fastq" "$1/$2/${2}_R2.fastq"
-    else
+    elif [[ $(find "$1/$2/" -name "*.fastq" | wc -l) -eq 1 ]]
+    then
         mv "$1/$2/${3}.fastq" "$1/$2/${2}_R1.fastq"
     fi
 
@@ -190,6 +193,7 @@ do
     case $1 in
         -b|--bp     ) bioproject="$2" ; shift 2 ;;
         -d|--dir    ) ldir="$2"       ; shift 2 ;;
+        -r|--ri     ) runinfo="$2"    ; shift 2 ;;
         -p|--pl     ) pl="$2"         ; shift 2 ;;
         -s|--skip   ) skip="skip"     ; shift   ;;
         -h|--help   ) usage ; exit 0 ;;
@@ -199,7 +203,20 @@ done
 
 
 # Check the existence of obligatory options
-[[ -z "$bioproject" ]] && error "BioProject is required. Exiting...\n$(usage)" 1
+[[ -z "$bioproject" && -z "$runinfo" ]] && error "BioProject is required. Exiting...\n$(usage)" 1
+
+# Check runinfo
+if [[ -n "$runinfo" ]]
+then
+    [[ ! -e "$runinfo" ]] && error "runinfo file does not exist. Exiting..." 1
+    runinfo=$(sed "/^$/d" "$runinfo")
+    [[ -z "$runinfo" ]] && error "runinfo file is empty. Exiting..." 1
+fi
+
+# Check folder
+[[ -n "$ldir" && -f "$ldir" ]] && error "Cannot create folder $ldir. Exiting..." 1
+[[ -n "$ldir" && ! -d "$ldir" ]] && mkdir -p "$ldir"
+
 
 # Default values
 [[ -z "$ldir" ]] && ldir="."
@@ -216,11 +233,11 @@ log="$ldir/log"
 # Handling status and exit
 set -o pipefail
 trap 'clean_up_kill' SIGINT SIGTERM
-trap 'clean_up runinfo $log' EXIT
+trap 'clean_up $log' EXIT
 
 # Download related information to data project
-runinfo=$(wget -q -O - "https://trace.ncbi.nlm.nih.gov/Traces/sra/sra.cgi?save=efetch&rettype=runinfo&db=sra&term=${bioproject}")
-[[ $(sed "/^$/d" <<< "$runinfo" | wc -l) -eq 0 ]] && error "Bioproject does not seem to exists. Exiting..." 0
+[[ -z "$runinfo" ]] && runinfo=$(wget -q -O - "https://trace.ncbi.nlm.nih.gov/Traces/sra/sra.cgi?save=efetch&rettype=runinfo&db=sra&term=${bioproject}" | sed "/^$/d")
+[[ -z "$runinfo" ]] && error "Bioproject does not seem to exist. Exiting..." 0
 
 # Field of interest (library name and weblink)
 fdn=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "SampleName" | cut -d ":" -f 1)
@@ -231,11 +248,12 @@ flk=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "download_path" | cut 
 myend=$(tail -n +2 <<< "$runinfo" | sed "/^$/d" | wc -l)
 while read line
 do
-    # Counter
+    # Progress bar
     ((mystep++))
+    [[ $mystep -lt $myend ]] && ProgressBar $mystep $myend
 
     # Filename, run and download link
-    fln=$(cut -d "," -f $fdn <<<$line)
+    fln=$(awk -v fdn=$fdn -vFPAT='([^,]*)|("[^"]+")' -vOFS=, '{print $fdn}' <<<$line)
     run=$(cut -d "," -f $fdr <<<$line)
     
     # Folder
@@ -258,22 +276,15 @@ do
     done
 
     # Fetch SRA file in the background (except if last)
-    if [[ $mystep -lt $myend ]]
-    then
-        (myprefetch "$ldir" "$fln" "$run" "$log") &
-    else
-        myprefetch "$ldir" "$fln" "$run" "$log"
-    fi
-
-    # Progress bar
-    ProgressBar $mystep $myend
+    (myprefetch "$ldir" "$fln" "$run" "$log") &
 
 done < <(tail -n +2 <<< "$runinfo" | sed "/^$/d")
 
 # Wait until every background job is done
 wait $(jobs -p)
+ProgressBar $mystep $myend
 
 # Check for errors
-[[ $(grep -E -i "error|warning" "$log") ]] && warning "Errors or waning present in $log." && exit 1
+[[ $(grep -E -i "error|warning" "$log") ]] && warning "Errors or warnings present in $log." && exit 1
 
 exit 0
