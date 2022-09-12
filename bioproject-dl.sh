@@ -1,6 +1,6 @@
 #!/bin/bash
 # Title: bioproject-dl.sh
-# Version: 0.2
+# Version: 0.3
 # Author: Frédéric CHEVALIER <fcheval@txbiomed.org>
 # Created in: 2022-04-09
 # Modified in: 2022-04-13
@@ -20,6 +20,7 @@ aim="Download fastq files from a given BioProject."
 # Versions #
 #==========#
 
+# v0.3 - 2022-09-11: replace wget with esearch/efetch to download runinfo
 # v0.2 - 2022-04-13: add option to load runinfo file
 # v0.1 - 2022-04-11: add parallel downloads / improve trap / improve runinfo handling
 # v0.0 - 2022-04-09: creation
@@ -177,7 +178,8 @@ function myprefetch {
 # Dependencies #
 #==============#
 
-test_dep wget 
+test_dep esearch
+test_dep efetch
 test_dep prefetch
 test_dep fasterq-dump
 
@@ -236,7 +238,7 @@ trap 'clean_up_kill' SIGINT SIGTERM
 trap 'clean_up $log' EXIT
 
 # Download related information to data project
-[[ -z "$runinfo" ]] && runinfo=$(wget -q -O - "https://trace.ncbi.nlm.nih.gov/Traces/sra/sra.cgi?save=efetch&rettype=runinfo&db=sra&term=${bioproject}" | sed "/^$/d")
+[[ -z "$runinfo" ]] && runinfo=$(esearch -db sra -query ${bioproject} | efetch -format runinfo | sed "/^$/d")
 [[ -z "$runinfo" ]] && error "Bioproject does not seem to exist. Exiting..." 0
 
 # Field of interest (library name and weblink)
