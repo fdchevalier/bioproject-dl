@@ -1,9 +1,9 @@
 #!/bin/bash
 # Title: bioproject-dl.sh
-# Version: 0.3
+# Version: 0.4
 # Author: Frédéric CHEVALIER <fcheval@txbiomed.org>
 # Created in: 2022-04-09
-# Modified in: 2022-04-13
+# Modified in: 2022-09-13
 # License: GPL v3
 
 
@@ -20,6 +20,7 @@ aim="Download fastq files from a given BioProject."
 # Versions #
 #==========#
 
+# v0.4 - 2022-09-12: add merge option / create rename function / improve traps
 # v0.3 - 2022-09-11: replace wget with esearch/efetch to download runinfo
 # v0.2 - 2022-04-13: add option to load runinfo file
 # v0.1 - 2022-04-11: add parallel downloads / improve trap / improve runinfo handling
@@ -36,7 +37,7 @@ version=$(grep -i -m 1 "version" "$0" | cut -d ":" -f 2 | sed "s/^ *//g")
 # Usage message
 function usage {
     echo -e "
-    \e[32m ${0##*/} \e[00m -b|--bp value -d|--dir path --r|--ri path -p|--pl number -s|--skip -h|--help
+    \e[32m ${0##*/} \e[00m -b|--bp value -d|--dir path --r|--ri path -p|--pl number -m|--merge -s|--skip -h|--help
 
 Aim: $aim
 
@@ -47,6 +48,7 @@ Options:
     -d, --dir       target directory
     -r, --ri        provide a runinfo file instead of the automatic download
     -p, --pl        number of parallel SRA downloads [default: 10]
+    -m, --merge     merge fastq files belonging to the same sample
     -s, --skip      skip download if fastq file already present
     -h, --help      this message
     "
@@ -110,12 +112,15 @@ function ProgressBar {
         _fill=$(printf "%${_done}s")
         _empty=$(printf "%${_left}s")
 
+        # Header
+        [[ -z "$3" ]] && hdr="Progress" || hdr="$3"
+
         # Build progressbar strings and print the ProgressBar line
         # Output example:
         # Progress : [########################################] 100%
         #printf "\rProgress : [${_fill// /=}${_empty// / }] ${_progress}%%"
-        printf "\r\e[32mProgress:\e[00m [${_fill// /=}${_empty// / }] ${_progress}%%"
-        
+        printf "\r\e[32m${hdr}:\e[00m [${_fill// /=}${_empty// / }] ${_progress}%%"
+
         [[ ${_progress} == 100 ]] && echo ""
     fi
 }
@@ -130,8 +135,17 @@ function clean_up {
 
 function clean_up_kill {
     echo
-    [[ -n "$run" ]] && rm -rf "$ldir/$fln/$run"*
+    # Stop jobs
     [[ -n $myjobs ]] && kill ${myjobs[@]} 2> /dev/null
+    wait
+
+    # Remove files
+    a=("$@")
+    for i in ${a[@]}
+    do
+        rm -rf "$i"*
+    done
+
     exit 1
 }
 
@@ -157,15 +171,36 @@ function myprefetch {
     # Convert sra into fastq
     fasterq-dump -O "$1/$2/" -f --split-files "$1/$2/$3" &>> "$4"
     rm -R "$1/$2/$3"
+}
 
-    # Rename file with more meaningful name
-    if [[ $(find "$1/$2/" -name "*.fastq" | wc -l) -eq 2 ]]
+
+# Rename fastq
+function rename_fastq {
+    # Rename if only one read
+    if [[ $(find "$1/$2/" \( -name "*.fastq" ! -name "*_1.fastq" ! -name "*_2.fastq" \) | wc -l) -eq 1 ]]
     then
-        mv "$1/$2/${3}_1.fastq" "$1/$2/${2}_R1.fastq"
-        mv "$1/$2/${3}_2.fastq" "$1/$2/${2}_R2.fastq"
-    elif [[ $(find "$1/$2/" -name "*.fastq" | wc -l) -eq 1 ]]
+        mv "$1/$2/"*.fastq "$1/$2/${2}_R1.fastq"
+    elif [[ $(find "$1/$2/" \( -name "*.fastq" ! -name "*_1.fastq" ! -name "*_2.fastq" \) | wc -l) -gt 1 ]]
     then
-        mv "$1/$2/${3}.fastq" "$1/$2/${2}_R1.fastq"
+        cat "$1/$2/"*.fastq > "$1/$2/${2}_R1.fastq" && find "$1/$2/" \( -name "*.fastq" ! -name "*_R1.fastq" \) -exec rm {} +
+    fi
+
+    # Rename read 1 file with more meaningful name
+    if [[ $(find "$1/$2/" -name "*_1.fastq" | wc -l) -gt 1 ]]
+    then
+        cat "$1/$2/"*_1.fastq > "$1/$2/${2}_R1.fastq" && rm "$1/$2/"*_1.fastq
+    elif [[ $(find "$1/$2/" -name "*_1.fastq" | wc -l) -eq 1 ]]
+    then
+        mv "$1/$2/"*_1.fastq "$1/$2/${2}_R1.fastq"
+    fi
+
+    # Rename read 2 file with more meaningful name
+    if [[ $(find "$1/$2/" -name "*_2.fastq" | wc -l) -gt 1 ]]
+    then
+        cat "$1/$2/"*_2.fastq > "$1/$2/${2}_R2.fastq" && rm "$1/$2/"*_2.fastq
+    elif [[ $(find "$1/$2/" -name "*_2.fastq" | wc -l) -eq 1 ]]
+    then
+        mv "$1/$2/"*_2.fastq "$1/$2/${2}_R2.fastq"
     fi
 
     # Compress
@@ -197,6 +232,7 @@ do
         -d|--dir    ) ldir="$2"       ; shift 2 ;;
         -r|--ri     ) runinfo="$2"    ; shift 2 ;;
         -p|--pl     ) pl="$2"         ; shift 2 ;;
+        -m|--merge  ) merge="merge"   ; shift   ;;
         -s|--skip   ) skip="skip"     ; shift   ;;
         -h|--help   ) usage ; exit 0 ;;
         *           ) error "Invalid option: $1\n$(usage)" 1 ;;
@@ -234,8 +270,12 @@ log="$ldir/log"
 
 # Handling status and exit
 set -o pipefail
-trap 'clean_up_kill' SIGINT SIGTERM
-trap 'clean_up $log' EXIT
+trap 'clean_up_kill ${to_del[@]}' SIGINT SIGTERM
+trap '[[ $? -eq 0 ]] && clean_up $log' EXIT
+
+#---------#
+# Runinfo #
+#---------#
 
 # Download related information to data project
 [[ -z "$runinfo" ]] && runinfo=$(esearch -db sra -query ${bioproject} | efetch -format runinfo | sed "/^$/d")
@@ -246,29 +286,37 @@ fdn=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "SampleName" | cut -d 
 fdr=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "Run" | cut -d ":" -f 1)
 flk=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "download_path" | cut -d ":" -f 1)
 
+
+#----------------#
+# Fastq Download #
+#----------------#
+
 # Download fastq files
 myend=$(tail -n +2 <<< "$runinfo" | sed "/^$/d" | wc -l)
 while read line
 do
     # Progress bar
     ((mystep++))
-    [[ $mystep -lt $myend ]] && ProgressBar $mystep $myend
+    [[ $mystep -lt $myend ]] && ProgressBar $mystep $myend "Download"
 
     # Filename, run and download link
     fln=$(awk -v fdn=$fdn -vFPAT='([^,]*)|("[^"]+")' -vOFS=, '{print $fdn}' <<<$line)
     run=$(cut -d "," -f $fdr <<<$line)
-    
+
     # Folder
     echo "$fln" >> "$log"
     [[ ! -d "$ldir/$fln/" ]] && mkdir -p "$ldir/$fln/"
-    
+
     # Check for fastq if requested
     if [[ "$skip" ]]
     then
+        ls_rn=$(find "$ldir/$fln/" -name "${run}_*.fastq*" | wc -l)
+        [[ $ls_rn -gt 0 ]] && continue
+
         ls_fl=$(find "$ldir/$fln/" -name "${fln}_R*.fastq*" | wc -l)
         [[ $ls_fl -gt 0 ]] && continue
     fi
-    
+
     # Pause when number of running job is expected
     myjobs=($(jobs -p))
     while [[ ${#myjobs[@]} -ge $pl ]]
@@ -277,16 +325,68 @@ do
         myjobs=($(jobs -p))
     done
 
-    # Fetch SRA file in the background (except if last)
+    # Fetch SRA file in the background
     (myprefetch "$ldir" "$fln" "$run" "$log") &
+
+    # Store path
+    to_del+=("$ldir/$fln/$run")
 
 done < <(tail -n +2 <<< "$runinfo" | sed "/^$/d")
 
 # Wait until every background job is done
 wait $(jobs -p)
-ProgressBar $mystep $myend
+ProgressBar $mystep $myend "Download"
+
+
+#-----------#
+# Log check #
+#-----------#
 
 # Check for errors
-[[ $(grep -E -i "error|warning" "$log") ]] && warning "Errors or warnings present in $log." && exit 1
+[[ $(grep -E -i "error|warning" "$log") ]] && error "Errors or warnings present in $log. Exiting..." 1
+
+
+#----------------#
+# Fastq renaming #
+#----------------#
+
+# Sanity check
+flns=$(tail -n +2 <<< "$runinfo" | awk -v fdn=$fdn -vFPAT='([^,]*)|("[^"]+")' -vOFS=, '{print $fdn}' | sort -u)
+flns_nb=$(wc -l <<< "$flns")
+
+[[ "$flns_nb" -ne "$myend" && -z "$merge" ]] && error "Several fastq files correspond to a single samples but merge was not used. Exiting..." 1
+
+# Rename fastq files
+unset to_del
+mystep=0
+myend=$flns_nb
+while read fln
+do
+    # Progress bar
+    ((mystep++))
+    [[ $mystep -lt $myend ]] && ProgressBar $mystep $myend "Renaming"
+
+    # Sample being processed
+    echo "$fln" >> "$log"
+
+    # Pause when number of running job is expected
+    myjobs=($(jobs -p))
+    while [[ ${#myjobs[@]} -ge $pl ]]
+    do
+        sleep 30s
+        myjobs=($(jobs -p))
+    done
+
+    # Fetch SRA file in the background
+    (rename_fastq "$ldir" "$fln" "$log") &
+
+    # Store path
+    to_del+=("$ldir/$fln/$fln")
+
+done <<< "$flns"
+
+# Wait until every background job is done
+wait $(jobs -p)
+ProgressBar $mystep $myend "Renaming"
 
 exit 0
