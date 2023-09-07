@@ -1,9 +1,9 @@
 #!/bin/bash
 # Title: bioproject-dl.sh
-# Version: 0.4
+# Version: 0.5
 # Author: Frédéric CHEVALIER <fcheval@txbiomed.org>
 # Created in: 2022-04-09
-# Modified in: 2022-09-13
+# Modified in: 2023-09-07
 # License: GPL v3
 
 
@@ -20,6 +20,7 @@ aim="Download fastq files from a given BioProject."
 # Versions #
 #==========#
 
+# v0.5 - 2023-09-07: remove samples which may be erroneously associated with BioProject
 # v0.4 - 2022-09-12: add merge option / create rename function / improve traps
 # v0.3 - 2022-09-11: replace wget with esearch/efetch to download runinfo
 # v0.2 - 2022-04-13: add option to load runinfo file
@@ -285,6 +286,21 @@ trap '[[ $? -eq 0 ]] && clean_up $log' EXIT
 fdn=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "SampleName" | cut -d ":" -f 1)
 fdr=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "Run" | cut -d ":" -f 1)
 flk=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "download_path" | cut -d ":" -f 1)
+fbp=$(head -n 1 <<< "$runinfo" | tr "," "\n" | grep -w -n "BioProject" | cut -d ":" -f 1)
+
+
+#------------------#
+# BioProject check #
+#------------------#
+
+# Check if non expected BioProject exist
+list_bp=$(sed "1d" <<< "$runinfo" | cut -d "," -f "$fbp" | sort -u | grep -w -v "${bioproject}")
+
+if [[ -n "$list_bp" ]]
+then
+    runinfo=$(grep -E -w -v "$(sed "s/ /|/g" <<< ${list_bp})" <<< "$runinfo")
+    warning "Unexpected BioProject(s) detected and removed: $list_bp"
+fi
 
 
 #----------------#
