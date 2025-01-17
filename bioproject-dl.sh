@@ -1,9 +1,9 @@
 #!/bin/bash
 # Title: bioproject-dl.sh
-# Version: 0.5
+# Version: 0.6
 # Author: Frédéric CHEVALIER <fcheval@txbiomed.org>
 # Created in: 2022-04-09
-# Modified in: 2023-09-07
+# Modified in: 2025-01-17
 # License: GPL v3
 
 
@@ -20,6 +20,7 @@ aim="Download fastq files from a given BioProject."
 # Versions #
 #==========#
 
+# v0.6 - 2025-01-17: check runinfo header
 # v0.5 - 2023-09-07: remove samples which may be erroneously associated with BioProject
 # v0.4 - 2022-09-12: add merge option / create rename function / improve traps
 # v0.3 - 2022-09-11: replace wget with esearch/efetch to download runinfo
@@ -250,6 +251,7 @@ then
     [[ ! -e "$runinfo" ]] && error "runinfo file does not exist. Exiting..." 1
     runinfo=$(sed "/^$/d" "$runinfo")
     [[ -z "$runinfo" ]] && error "runinfo file is empty. Exiting..." 1
+    [[ ! $(head -1 <<< "$runinfo" | grep -w -n "SampleName") ]] && error "header cannot be detected from the runinfo. Exiting..." 1
 fi
 
 # Check folder
